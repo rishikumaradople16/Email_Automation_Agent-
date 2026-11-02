@@ -1,34 +1,3 @@
-"""
-Conference Outreach Agent - Single Sheet Autonomous Version.
-
-Features:
-- Single Google Sheet (Columns A to T):
-    Col A-N: Extractor data (Speaker, Company, LinkedIn, Email, Verification, etc.)
-    Col O:   outreach status (sent, sending, failed, skipped_*)
-    Col P:   reply status (replied, bounced)
-    Col Q:   reply sentiment (INTERESTED, MEETING_REQUESTED, etc.)
-    Col R:   received reply (FULL conversation transcript: all outreach, follow-ups & replies)
-    Col S:   sent message (exact initial email sent)
-    Col T:   thread id (Gmail thread ID for correlation)
-
-- Full Conversation Transcript:
-    Chronologically captures every message exchanged in the thread with timestamp and sender tags.
-    Updates whenever follow-up emails are sent or new replies are received.
-    Prevents duplicate alerts by tracking processed message IDs.
-
-- Option B: 24/7 Autonomous Scheduler:
-    - Watcher: Monitors for incoming replies & bounces around the clock (polling every N minutes).
-    - Sender:  Wakes up at scheduled time (default 19:00 / 7:00 PM), sends to all pending verified leads
-               added that day with humanized random jitter delays, and goes back to sleep until the next day.
-
-Commands:
-  python automation.py run [--send-now]   # 24/7 autonomous runner (Watcher 24/7 + Sender at 7 PM)
-  python automation.py send               # Run a single outreach send pass immediately
-  python automation.py watch              # Run a single reply watcher pass immediately
-  python automation.py summary            # Display metrics dashboard
-  python automation.py init-sheet         # Verify and prepare sheet headers
-"""
-
 import base64
 import datetime as dt
 import html
@@ -96,9 +65,6 @@ SKIP_IF_ALREADY_REPLIED = _flag("SKIP_IF_ALREADY_REPLIED", "1")
 USE_GEMINI = _flag("USE_GEMINI", "1")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
-
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 SERVICE_ACCOUNT_FILE = os.getenv("SERVICE_ACCOUNT_FILE", "service_account.json")
 GMAIL_CREDENTIALS_FILE = os.getenv("GMAIL_CREDENTIALS_FILE", "credentials.json")
@@ -476,23 +442,24 @@ def sheets():
 
 
 def ensure_columns(ws, create: bool = True) -> SheetColumnMap:
-    headers = [str(h) for h in ws.row_values(1)]
-    if not headers:
-        raise ValueError("Row 1 (the header row) is empty.")
-    cmap = SheetColumnMap(headers)
-    missing = cmap.missing_agent_columns()
-    if not missing:
-        return cmap
-    names = [AGENT_HEADER_NAMES[a] for a in missing]
-    if not create:
-        print(f"[Sheet Notice] Missing columns (will be added on a live run): {', '.join(names)}")
-        return cmap
-    new_headers = headers + names
-    if ws.col_count < len(new_headers):
-        ws.add_cols(len(new_headers) - ws.col_count)
-    ws.update(range_name=f"A1:{rowcol_to_a1(1, len(new_headers))}", values=[new_headers])
-    print(f"✅ Added missing columns to row 1: {', '.join(names)}")
-    return SheetColumnMap(new_headers)
+    with sheet_lock:
+        headers = [str(h) for h in ws.row_values(1)]
+        if not headers:
+            raise ValueError("Row 1 (the header row) is empty.")
+        cmap = SheetColumnMap(headers)
+        missing = cmap.missing_agent_columns()
+        if not missing:
+            return cmap
+        names = [AGENT_HEADER_NAMES[a] for a in missing]
+        if not create:
+            print(f"[Sheet Notice] Missing columns (will be added on a live run): {', '.join(names)}")
+            return cmap
+        new_headers = headers + names
+        if ws.col_count < len(new_headers):
+            ws.add_cols(len(new_headers) - ws.col_count)
+        ws.update(range_name=f"A1:{rowcol_to_a1(1, len(new_headers))}", values=[new_headers])
+        print(f"✅ Added missing columns to row 1: {', '.join(names)}")
+        return SheetColumnMap(new_headers)
 
 
 def paused(sh) -> bool:
@@ -525,40 +492,41 @@ def _cell(v: Any) -> str:
 def write_rows(ws, cmap: SheetColumnMap, items: List[Dict[str, Any]]) -> bool:
     if not items:
         return True
-    try:
-        ids = [str(v).strip() for v in ws.col_values(cmap.speaker_id + 1)]
-    except Exception as e:
-        print(f"[Sheets Warning] Could not verify rows before writing: {e}")
-        return False
-
-    data = []
-    for it in items:
-        n, sid = it["row_num"], it["sid"]
-        if n - 1 < len(ids) and ids[n - 1] == sid:
-            row = n
-        else:
-            positions = [i + 1 for i, v in enumerate(ids) if v == sid]
-            if sid and it["occ"] < len(positions):
-                row = positions[it["occ"]]
-            else:
-                print(f"[Sheets Warning] Row for {sid or '(blank id)'} moved or was deleted - skipped this write.")
-                continue
-        for col, val in it["updates"].items():
-            if col is None:
-                continue
-            data.append({"range": rowcol_to_a1(row, col + 1), "values": [[_cell(val)]]})
-    if not data:
-        return False
-    for attempt in range(2):
+    with sheet_lock:
         try:
-            ws.batch_update(data)
-            return True
+            ids = [str(v).strip() for v in ws.col_values(cmap.speaker_id + 1)]
         except Exception as e:
-            if attempt == 1:
-                print(f"[Sheets Warning] Write failed: {e}")
-                return False
-            time.sleep(2)
-    return False
+            print(f"[Sheets Warning] Could not verify rows before writing: {e}")
+            return False
+
+        data = []
+        for it in items:
+            n, sid = it["row_num"], it["sid"]
+            if n - 1 < len(ids) and ids[n - 1] == sid:
+                row = n
+            else:
+                positions = [i + 1 for i, v in enumerate(ids) if v == sid]
+                if sid and it["occ"] < len(positions):
+                    row = positions[it["occ"]]
+                else:
+                    print(f"[Sheets Warning] Row for {sid or '(blank id)'} moved or was deleted - skipped this write.")
+                    continue
+            for col, val in it["updates"].items():
+                if col is None:
+                    continue
+                data.append({"range": rowcol_to_a1(row, col + 1), "values": [[_cell(val)]]})
+        if not data:
+            return False
+        for attempt in range(2):
+            try:
+                ws.batch_update(data)
+                return True
+            except Exception as e:
+                if attempt == 1:
+                    print(f"[Sheets Warning] Write failed: {e}")
+                    return False
+                time.sleep(2)
+        return False
 
 
 def item(row: Dict[str, Any], updates: Dict[Optional[int], Any]) -> Dict[str, Any]:
@@ -597,171 +565,171 @@ def alert(text: str):
 # Workflow 1: send pass
 # ==============================================================================
 def send_batch():
-    with sheet_lock:
-        print(f"\n[{now()}] --- Starting Outreach Send Pass ---")
-        if DRY_RUN:
-            print("⚡ [DRY RUN ACTIVE] Emails are previewed only. Nothing is sent or written.")
+    print(f"\n[{now()}] --- Starting Outreach Send Pass ---")
+    if DRY_RUN:
+        print("⚡ [DRY RUN ACTIVE] Emails are previewed only. Nothing is sent or written.")
 
+    try:
+        sh, ws = sheets()
+        cmap = ensure_columns(ws, create=not DRY_RUN)
+    except Exception as e:
+        print(f"[Error] Failed to connect to Google Sheets: {e}")
+        return
+
+    if paused(sh):
+        print("⏸️ Paused via Control!B1 (TRUE). Halting sending.")
+        return
+
+    svc = None
+    if not DRY_RUN:
         try:
-            sh, ws = sheets()
-            cmap = ensure_columns(ws, create=not DRY_RUN)
+            svc = gmail()
         except Exception as e:
-            print(f"[Error] Failed to connect to Google Sheets: {e}")
+            print(f"[Error] Failed to connect to Gmail: {e}")
             return
 
-        if paused(sh):
-            print("⏸️ Paused via Control!B1 (TRUE). Halting sending.")
-            return
-
-        svc = None
-        if not DRY_RUN:
-            try:
-                svc = gmail()
-            except Exception as e:
-                print(f"[Error] Failed to connect to Gmail: {e}")
-                return
-
-        try:
+    try:
+        with sheet_lock:
             all_values = ws.get_all_values()
-        except Exception as e:
-            print(f"[Error] Failed to read sheet '{ws.title}': {e}")
-            return
-        if len(all_values) < 2:
-            print(f"No data rows found in sheet '{ws.title}'.")
-            return
+    except Exception as e:
+        print(f"[Error] Failed to read sheet '{ws.title}': {e}")
+        return
+    if len(all_values) < 2:
+        print(f"No data rows found in sheet '{ws.title}'.")
+        return
 
-        rows = snapshot_rows(all_values, cmap)
-        state = load_state()
-        sent_today = get_sent_today(state)
-        cap_str = str(DAILY_CAP) if DAILY_CAP > 0 else "Unlimited"
-        print(f"📊 Daily progress: {sent_today}/{cap_str} emails sent today. Rows in sheet: {len(rows)}")
+    rows = snapshot_rows(all_values, cmap)
+    state = load_state()
+    sent_today = get_sent_today(state)
+    cap_str = str(DAILY_CAP) if DAILY_CAP > 0 else "Unlimited"
+    print(f"📊 Daily progress: {sent_today}/{cap_str} emails sent today. Rows in sheet: {len(rows)}")
 
-        sent_pairs: set = set()
-        replied_emails: set = set()
-        for r in rows:
-            c = r["c"]
+    sent_pairs: set = set()
+    replied_emails: set = set()
+    for r in rows:
+        c = r["c"]
+        email = g(c, cmap.email).lower()
+        status = g(c, cmap.outreach_status).lower()
+        if email and status in ("sent", "sending"):
+            if g(c, cmap.conf_id):
+                sent_pairs.add((email, g(c, cmap.conf_id).lower()))
+            if g(c, cmap.conf_name):
+                sent_pairs.add((email, g(c, cmap.conf_name).lower()))
+        if email and g(c, cmap.reply_status).lower() == "replied":
+            replied_emails.add(email)
+
+    pending: List[Dict[str, Any]] = []
+
+    def flush():
+        if pending and not DRY_RUN:
+            write_rows(ws, cmap, pending)
+        pending.clear()
+
+    handled = skipped = sent_pass = 0
+
+    try:
+        for row in rows:
+            c = row["c"]
+            sid = row["sid"]
+            conf_id, conf_name = g(c, cmap.conf_id), g(c, cmap.conf_name)
+            name, title, company = g(c, cmap.speaker_name), g(c, cmap.job_title), g(c, cmap.company)
             email = g(c, cmap.email).lower()
-            status = g(c, cmap.outreach_status).lower()
-            if email and status in ("sent", "sending"):
-                if g(c, cmap.conf_id):
-                    sent_pairs.add((email, g(c, cmap.conf_id).lower()))
-                if g(c, cmap.conf_name):
-                    sent_pairs.add((email, g(c, cmap.conf_name).lower()))
-            if email and g(c, cmap.reply_status).lower() == "replied":
-                replied_emails.add(email)
+            estatus = g(c, cmap.verification_status).lower()
+            current = g(c, cmap.outreach_status).lower()
 
-        pending: List[Dict[str, Any]] = []
+            if current in FINAL_STATUSES:
+                handled += 1
+                continue
 
-        def flush():
-            if pending and not DRY_RUN:
-                write_rows(ws, cmap, pending)
-            pending.clear()
+            conf_tag = conf_id.lower() if conf_id else conf_name.lower()
+            dedupe_key = f"{email}|{conf_tag}" if email else sid.lower()
 
-        handled = skipped = sent_pass = 0
+            is_dup = False
+            if email:
+                if conf_id and (email, conf_id.lower()) in sent_pairs:
+                    is_dup = True
+                elif conf_name and (email, conf_name.lower()) in sent_pairs:
+                    is_dup = True
 
-        try:
-            for row in rows:
-                c = row["c"]
-                sid = row["sid"]
-                conf_id, conf_name = g(c, cmap.conf_id), g(c, cmap.conf_name)
-                name, title, company = g(c, cmap.speaker_name), g(c, cmap.job_title), g(c, cmap.company)
-                email = g(c, cmap.email).lower()
-                estatus = g(c, cmap.verification_status).lower()
-                current = g(c, cmap.outreach_status).lower()
+            skip = None
+            if is_dup:
+                skip = "skipped_duplicate"
+            elif not email:
+                skip = "skipped_no_email"
+            elif estatus not in ALLOWED_EMAIL_STATUS:
+                skip = "skipped_unverified"
+            elif SKIP_IF_ALREADY_REPLIED and email in replied_emails:
+                skip = "skipped_replied"
 
-                if current in FINAL_STATUSES:
-                    handled += 1
+            if skip:
+                if current == skip:
                     continue
+                skipped += 1
+                print(f"⏩ {skip}: {name or sid} ({conf_name}) <{email or 'no email'}>")
+                pending.append(item(row, {cmap.outreach_status: skip}))
+                continue
 
-                conf_tag = conf_id.lower() if conf_id else conf_name.lower()
-                dedupe_key = f"{email}|{conf_tag}" if email else sid.lower()
+            if DAILY_CAP > 0 and sent_today >= DAILY_CAP:
+                print(f"🛑 Daily cap ({DAILY_CAP}) reached. Stopping send pass.")
+                break
+            if paused(sh):
+                print("⏸️ Paused via Control!B1 during the pass. Halting.")
+                break
 
-                is_dup = False
-                if email:
-                    if conf_id and (email, conf_id.lower()) in sent_pairs:
-                        is_dup = True
-                    elif conf_name and (email, conf_name.lower()) in sent_pairs:
-                        is_dup = True
+            subject, body = build_email(name, title, company, conf_name)
+            full_message = f"Subject: {subject}\n\n{body}"
 
-                skip = None
-                if is_dup:
-                    skip = "skipped_duplicate"
-                elif not email:
-                    skip = "skipped_no_email"
-                elif estatus not in ALLOWED_EMAIL_STATUS:
-                    skip = "skipped_unverified"
-                elif SKIP_IF_ALREADY_REPLIED and email in replied_emails:
-                    skip = "skipped_replied"
-
-                if skip:
-                    if current == skip:
-                        continue
-                    skipped += 1
-                    print(f"⏩ {skip}: {name or sid} ({conf_name}) <{email or 'no email'}>")
-                    pending.append(item(row, {cmap.outreach_status: skip}))
-                    continue
-
-                if DAILY_CAP > 0 and sent_today >= DAILY_CAP:
-                    print(f"🛑 Daily cap ({DAILY_CAP}) reached. Stopping send pass.")
-                    break
-                if paused(sh):
-                    print("⏸️ Paused via Control!B1 during the pass. Halting.")
-                    break
-
-                subject, body = build_email(name, title, company, conf_name)
-                full_message = f"Subject: {subject}\n\n{body}"
-
-                if DRY_RUN:
-                    print("\n--- [DRY RUN PREVIEW] ---")
-                    print(f"Row: {row['row_num']}\nTo: {name} <{email}>\nConference: {conf_name}")
-                    print(f"Subject: {subject}\nBody:\n{body}")
-                    print("-------------------------\n")
-                    if conf_id:
-                        sent_pairs.add((email, conf_id.lower()))
-                    if conf_name:
-                        sent_pairs.add((email, conf_name.lower()))
-                    sent_today += 1
-                    sent_pass += 1
-                    continue
-
-                flush()
-
-                # Record 'sending' BEFORE dispatching
-                if not write_rows(ws, cmap, [item(row, {cmap.outreach_status: "sending", cmap.sent_message: full_message})]):
-                    print(f"❌ Could not record 'sending' for {name} - NOT sending. Stopping this pass.")
-                    break
-
-                try:
-                    msg_id, thread_id = send_mail(svc, email, subject, body)
-                except Exception as e:
-                    print(f"❌ FAILED to send to {email}: {e}")
-                    write_rows(ws, cmap, [item(row, {cmap.outreach_status: "failed"})])
-                    time.sleep(3)
-                    continue
-
-                record_send_in_state(state, dedupe_key, email, conf_tag, thread_id, msg_id, sid)
+            if DRY_RUN:
+                print("\n--- [DRY RUN PREVIEW] ---")
+                print(f"Row: {row['row_num']}\nTo: {name} <{email}>\nConference: {conf_name}")
+                print(f"Subject: {subject}\nBody:\n{body}")
+                print("-------------------------\n")
                 if conf_id:
                     sent_pairs.add((email, conf_id.lower()))
                 if conf_name:
                     sent_pairs.add((email, conf_name.lower()))
                 sent_today += 1
                 sent_pass += 1
-                print(f"✅ SENT: {name} <{email}> ({conf_name}) | Today: {sent_today}/{cap_str}")
+                continue
 
-                if not write_rows(ws, cmap, [item(row, {
-                    cmap.outreach_status: "sent", cmap.sent_message: full_message, cmap.thread_id: thread_id,
-                })]):
-                    print(f"⚠️ Email was SENT but the sheet update failed. Row stays 'sending'. "
-                          f"thread_id={thread_id} (saved in {STATE_FILE})")
-
-                delay = random.randint(*DELAY_RANGE)
-                print(f"⏳ Waiting {delay}s before next send...")
-                time.sleep(delay)
-        finally:
             flush()
 
-        print(f"[{now()}] --- Send Pass Completed (sent: {sent_pass} | skipped: {skipped} | "
-              f"already handled: {handled}) ---\n")
+            # Record 'sending' BEFORE dispatching
+            if not write_rows(ws, cmap, [item(row, {cmap.outreach_status: "sending", cmap.sent_message: full_message})]):
+                print(f"❌ Could not record 'sending' for {name} - NOT sending. Stopping this pass.")
+                break
+
+            try:
+                msg_id, thread_id = send_mail(svc, email, subject, body)
+            except Exception as e:
+                print(f"❌ FAILED to send to {email}: {e}")
+                write_rows(ws, cmap, [item(row, {cmap.outreach_status: "failed"})])
+                time.sleep(3)
+                continue
+
+            record_send_in_state(state, dedupe_key, email, conf_tag, thread_id, msg_id, sid)
+            if conf_id:
+                sent_pairs.add((email, conf_id.lower()))
+            if conf_name:
+                sent_pairs.add((email, conf_name.lower()))
+            sent_today += 1
+            sent_pass += 1
+            print(f"✅ SENT: {name} <{email}> ({conf_name}) | Today: {sent_today}/{cap_str}")
+
+            if not write_rows(ws, cmap, [item(row, {
+                cmap.outreach_status: "sent", cmap.sent_message: full_message, cmap.thread_id: thread_id,
+            })]):
+                print(f"⚠️ Email was SENT but the sheet update failed. Row stays 'sending'. "
+                      f"thread_id={thread_id} (saved in {STATE_FILE})")
+
+            delay = random.randint(*DELAY_RANGE)
+            print(f"⏳ Waiting {delay}s before next send...")
+            time.sleep(delay)
+    finally:
+        flush()
+
+    print(f"[{now()}] --- Send Pass Completed (sent: {sent_pass} | skipped: {skipped} | "
+          f"already handled: {handled}) ---\n")
 
 
 # ==============================================================================
@@ -807,11 +775,26 @@ def extract_body_text(msg: Dict[str, Any]) -> str:
     raw = plain_text or (clean_html(html_text) if html_text else "") or msg.get("snippet", "")
     if not raw:
         return ""
-    for pat in [r"\nOn .+?wrote:", r"\n[-]+ Original Message [-]+", r"\n_{10,}", r"\nFrom: .+?\nSent: .+?"]:
+
+    # Normalize unicode non-breaking spaces common in Gmail timestamps
+    raw = raw.replace("\u202f", " ").replace("\xa0", " ")
+
+    # Strip multi-line reply headers (e.g. 'On Mon, ... wrote:')
+    patterns = [
+        r"(?:\r?\n|^)\s*On\s+[\s\S]+?wrote\s*:",
+        r"(?:\r?\n|^)\s*[-]+\s*Original Message\s*[-]+",
+        r"(?:\r?\n|^)\s*_{5,}",
+        r"(?:\r?\n|^)\s*From:\s+[\s\S]+?Sent:\s+",
+    ]
+    for pat in patterns:
         parts = re.split(pat, raw, flags=re.IGNORECASE)
         if parts and parts[0].strip():
-            raw = parts[0].strip()
-    return raw.strip()
+            raw = parts[0]
+            break
+
+    # Strip quoted lines starting with '>'
+    lines = [line for line in raw.splitlines() if not line.strip().startswith(">")]
+    return "\n".join(lines).strip()
 
 
 def get_msg_timestamp(msg: Dict[str, Any]) -> str:
@@ -872,152 +855,121 @@ def build_conversation_transcript(
 
 
 def watch():
-    with sheet_lock:
-        print(f"\n[{now()}] --- Starting Reply Watcher Pass ---")
-        try:
-            sh, ws = sheets()
-            cmap = ensure_columns(ws, create=True)
-            svc = gmail()
-            my_email = svc.users().getProfile(userId="me").execute().get("emailAddress", "").strip().lower()
+    print(f"\n[{now()}] --- Starting Reply Watcher Pass ---")
+    try:
+        sh, ws = sheets()
+        cmap = ensure_columns(ws, create=True)
+        svc = gmail()
+        my_email = svc.users().getProfile(userId="me").execute().get("emailAddress", "").strip().lower()
+        with sheet_lock:
             all_values = ws.get_all_values()
-        except Exception as e:
-            print(f"[Error] Watcher setup failed: {e}")
-            return
-        if len(all_values) < 2:
-            print("No data rows found in sheet.")
-            return
+    except Exception as e:
+        print(f"[Error] Watcher setup failed: {e}")
+        return
+    if len(all_values) < 2:
+        print("No data rows found in sheet.")
+        return
 
-        my_emails = {my_email}
-        if os.getenv("SENDER_EMAIL", "").strip():
-            my_emails.add(os.getenv("SENDER_EMAIL").strip().lower())
+    my_emails = {my_email}
+    if os.getenv("SENDER_EMAIL", "").strip():
+        my_emails.add(os.getenv("SENDER_EMAIL").strip().lower())
 
-        rows = snapshot_rows(all_values, cmap)
-        state = load_state()
-        checked = replies_found = bounces_found = 0
-        sent_threads = state.get("threads", {})
+    rows = snapshot_rows(all_values, cmap)
+    state = load_state()
+    checked = replies_found = bounces_found = 0
+    sent_threads = state.get("threads", {})
 
-        print(f"📊 Scanning {len(rows)} leads in sheet for replies & conversation updates...")
+    print(f"📊 Scanning {len(rows)} leads in sheet for replies & conversation updates...")
 
-        for row in rows:
-            c = row["c"]
-            outreach = g(c, cmap.outreach_status).lower()
-            email = g(c, cmap.email).lower()
-            conf_id, conf_name = g(c, cmap.conf_id), g(c, cmap.conf_name)
-            name = g(c, cmap.speaker_name) or "Speaker"
-            company = g(c, cmap.company)
-            conf_tag = conf_id.lower() if conf_id else conf_name.lower()
-            dedupe_key = f"{email}|{conf_tag}"
+    for row in rows:
+        c = row["c"]
+        outreach = g(c, cmap.outreach_status).lower()
+        email = g(c, cmap.email).lower()
+        conf_id, conf_name = g(c, cmap.conf_id), g(c, cmap.conf_name)
+        name = g(c, cmap.speaker_name) or "Speaker"
+        company = g(c, cmap.company)
+        conf_tag = conf_id.lower() if conf_id else conf_name.lower()
+        dedupe_key = f"{email}|{conf_tag}"
 
-            if not email:
-                continue
+        if not email:
+            continue
 
-            is_sent = (
-                outreach in ("sent", "sending")
-                or dedupe_key in sent_threads
-                or bool(g(c, cmap.thread_id))
-            )
-            if not is_sent:
-                continue
+        is_sent = (
+            outreach in ("sent", "sending")
+            or dedupe_key in sent_threads
+            or bool(g(c, cmap.thread_id))
+        )
+        if not is_sent:
+            continue
 
-            # Thread ID lookup
-            thread_id = g(c, cmap.thread_id) or sent_threads.get(dedupe_key, {}).get("thread_id", "")
-            if not thread_id:
-                try:
-                    q_res = svc.users().threads().list(userId="me", q=f"{email}", maxResults=5).execute()
-                    th_list = q_res.get("threads", [])
-                    if th_list:
-                        thread_id = th_list[0]["id"]
-                except Exception as e:
-                    print(f"[Watch Notice] Gmail query for {email} failed: {e}")
-
-            if not thread_id:
-                continue
-
-            checked += 1
+        # Thread ID lookup
+        thread_id = g(c, cmap.thread_id) or sent_threads.get(dedupe_key, {}).get("thread_id", "")
+        if not thread_id:
             try:
-                th = svc.users().threads().get(userId="me", id=thread_id, format="full").execute()
+                q_res = svc.users().threads().list(userId="me", q=f"{email}", maxResults=5).execute()
+                th_list = q_res.get("threads", [])
+                if th_list:
+                    thread_id = th_list[0]["id"]
             except Exception as e:
-                print(f"[Watch Warning] Could not fetch thread {thread_id} for {email}: {e}")
-                continue
+                print(f"[Watch Notice] Gmail query for {email} failed: {e}")
 
-            messages = th.get("messages", [])
-            if len(messages) <= 1:
-                continue
+        if not thread_id:
+            continue
 
-            # Full chronological conversation transcript
-            transcript = build_conversation_transcript(messages, my_emails, name, email)
-            current_transcript = g(c, cmap.received_reply)
+        checked += 1
+        try:
+            th = svc.users().threads().get(userId="me", id=thread_id, format="full").execute()
+        except Exception as e:
+            print(f"[Watch Warning] Could not fetch thread {thread_id} for {email}: {e}")
+            continue
 
-            # Identify all incoming external messages (replies from lead or delivery bounces)
-            incoming = []
-            for idx_msg, msg in enumerate(messages):
-                headers = {h["name"].lower(): h["value"] for h in msg.get("payload", {}).get("headers", [])}
-                sender = headers.get("from", "").lower()
-                subj = headers.get("subject", "").lower()
+        messages = th.get("messages", [])
+        if len(messages) <= 1:
+            continue
 
-                is_bounce = (
-                    "mailer-daemon" in sender or "postmaster" in sender
-                    or "delivery status notification" in subj
-                )
-                is_from_us = any(me and me in sender for me in my_emails)
-                if idx_msg > 0 and (is_bounce or not is_from_us or email in sender):
-                    incoming.append((msg, is_bounce))
+        # Full chronological conversation transcript
+        transcript = build_conversation_transcript(messages, my_emails, name, email)
+        current_transcript = g(c, cmap.received_reply)
 
-            # Thread tracking from state to prevent duplicate alerts
-            thread_rec = sent_threads.setdefault(dedupe_key, {})
-            last_processed_id = thread_rec.get("last_processed_reply_id")
+        # Identify all incoming external messages (replies from lead or delivery bounces)
+        incoming = []
+        for idx_msg, msg in enumerate(messages):
+            headers = {h["name"].lower(): h["value"] for h in msg.get("payload", {}).get("headers", [])}
+            sender = headers.get("from", "").lower()
+            subj = headers.get("subject", "").lower()
 
-            if not incoming:
-                # Only our sent messages exist in the thread so far
-                if current_transcript != transcript:
-                    write_rows(ws, cmap, [item(row, {cmap.received_reply: transcript, cmap.thread_id: thread_id})])
-                    thread_rec["last_msg_count"] = len(messages)
-                    save_state(state)
-                    print(f"   📝 Updated transcript for {name} <{email}> (follow-up synced).")
-                continue
-
-            latest_msg, is_bounce = incoming[-1]
-            latest_incoming_id = latest_msg.get("id")
-            is_new_reply = (last_processed_id != latest_incoming_id)
-
-            if is_bounce:
-                notice = extract_body_text(latest_msg)[:500] or "Delivery Status Notification (Failure)"
-                needs_update = (current_transcript != transcript or g(c, cmap.reply_status).lower() != "bounced")
-                if needs_update:
-                    write_rows(ws, cmap, [item(row, {
-                        cmap.reply_status: "bounced",
-                        cmap.reply_sentiment: "BOUNCE (NEGATIVE)",
-                        cmap.received_reply: transcript,
-                        cmap.thread_id: thread_id,
-                    })])
-
-                if is_new_reply:
-                    thread_rec["last_processed_reply_id"] = latest_incoming_id
-                    thread_rec["last_msg_count"] = len(messages)
-                    save_state(state)
-                    bounces_found += 1
-                    print(f"   ⚠️ Bounce recorded for {name} <{email}>!")
-                    alert(f"⚠️ BOUNCE DETECTED\nSpeaker: {name} ({company})\nEmail: {email}\n"
-                          f"Conference: {conf_name}\n\nNotice:\n{notice[:250]}")
-                continue
-
-            # Normal reply from lead
-            latest_text = extract_body_text(latest_msg)
-            analysis = ai_agent.analyze_reply(latest_text, name, company, conf_name)
-            intent = analysis.get("intent", "OTHER")
-            sentiment = analysis.get("sentiment", "NEUTRAL")
-            summary = analysis.get("summary", latest_text[:150])
-
-            needs_update = (
-                current_transcript != transcript
-                or g(c, cmap.reply_status).lower() != "replied"
-                or not g(c, cmap.reply_sentiment)
+            is_bounce = (
+                "mailer-daemon" in sender or "postmaster" in sender
+                or "delivery status notification" in subj
             )
+            is_from_us = any(me and me in sender for me in my_emails)
+            if idx_msg > 0 and (is_bounce or not is_from_us or email in sender):
+                incoming.append((msg, is_bounce))
 
+        # Thread tracking from state to prevent duplicate alerts
+        thread_rec = sent_threads.setdefault(dedupe_key, {})
+        last_processed_id = thread_rec.get("last_processed_reply_id")
+
+        if not incoming:
+            # Only our sent messages exist in the thread so far
+            if current_transcript != transcript:
+                write_rows(ws, cmap, [item(row, {cmap.received_reply: transcript, cmap.thread_id: thread_id})])
+                thread_rec["last_msg_count"] = len(messages)
+                save_state(state)
+                print(f"   📝 Updated transcript for {name} <{email}> (follow-up synced).")
+            continue
+
+        latest_msg, is_bounce = incoming[-1]
+        latest_incoming_id = latest_msg.get("id")
+        is_new_reply = (last_processed_id != latest_incoming_id)
+
+        if is_bounce:
+            notice = extract_body_text(latest_msg)[:500] or "Delivery Status Notification (Failure)"
+            needs_update = (current_transcript != transcript or g(c, cmap.reply_status).lower() != "bounced")
             if needs_update:
                 write_rows(ws, cmap, [item(row, {
-                    cmap.reply_status: "replied",
-                    cmap.reply_sentiment: f"{intent} ({sentiment})",
+                    cmap.reply_status: "bounced",
+                    cmap.reply_sentiment: "BOUNCE (NEGATIVE)",
                     cmap.received_reply: transcript,
                     cmap.thread_id: thread_id,
                 })])
@@ -1026,25 +978,56 @@ def watch():
                 thread_rec["last_processed_reply_id"] = latest_incoming_id
                 thread_rec["last_msg_count"] = len(messages)
                 save_state(state)
-                replies_found += 1
-                print(f"   ✅ New reply received from {name} <{email}>! Intent: {intent} ({sentiment})")
-                print(f"      Full back-and-forth transcript ({len(messages)} messages) logged to Sheet Column R.")
+                bounces_found += 1
+                print(f"   ⚠️ Bounce recorded for {name} <{email}>!")
+                alert(f"⚠️ BOUNCE DETECTED\nSpeaker: {name} ({company})\nEmail: {email}\n"
+                      f"Conference: {conf_name}\n\nNotice:\n{notice[:250]}")
+            continue
 
-                badge = {
-                    "INTERESTED": "🔥 INTERESTED", "MEETING_REQUESTED": "📅 MEETING REQUESTED",
-                    "OUT_OF_OFFICE": "🌴 OUT OF OFFICE", "REFERRAL": "🔄 REFERRAL",
-                    "NOT_INTERESTED": "⛔ NOT INTERESTED", "UNSUBSCRIBE": "🚫 UNSUBSCRIBE",
-                }.get(intent, "💬 NEW REPLY")
-                alert(f"{badge}\nSpeaker: {name} ({company})\nEmail: {email}\nConference: {conf_name}\n"
-                      f"Intent: {intent} ({sentiment})\n\nLatest Reply:\n{latest_text[:400]}")
-            else:
-                if needs_update:
-                    print(f"   📝 Updated conversation transcript for {name} <{email}> ({len(messages)} messages).")
-                    thread_rec["last_msg_count"] = len(messages)
-                    save_state(state)
+        # Normal reply from lead
+        latest_text = extract_body_text(latest_msg)
+        analysis = ai_agent.analyze_reply(latest_text, name, company, conf_name)
+        intent = analysis.get("intent", "OTHER")
+        sentiment = analysis.get("sentiment", "NEUTRAL")
+        summary = analysis.get("summary", latest_text[:150])
 
-        print(f"[{now()}] --- Watcher Completed (Scanned: {checked} | New Replies: {replies_found} | "
-              f"Bounces: {bounces_found}) ---\n")
+        needs_update = (
+            current_transcript != transcript
+            or g(c, cmap.reply_status).lower() != "replied"
+            or not g(c, cmap.reply_sentiment)
+        )
+
+        if needs_update:
+            write_rows(ws, cmap, [item(row, {
+                cmap.reply_status: "replied",
+                cmap.reply_sentiment: f"{intent} ({sentiment})",
+                cmap.received_reply: transcript,
+                cmap.thread_id: thread_id,
+            })])
+
+        if is_new_reply:
+            thread_rec["last_processed_reply_id"] = latest_incoming_id
+            thread_rec["last_msg_count"] = len(messages)
+            save_state(state)
+            replies_found += 1
+            print(f"   ✅ New reply received from {name} <{email}>! Intent: {intent} ({sentiment})")
+            print(f"      Full back-and-forth transcript ({len(messages)} messages) logged to Sheet Column R.")
+
+            badge = {
+                "INTERESTED": "🔥 INTERESTED", "MEETING_REQUESTED": "📅 MEETING REQUESTED",
+                "OUT_OF_OFFICE": "🌴 OUT OF OFFICE", "REFERRAL": "🔄 REFERRAL",
+                "NOT_INTERESTED": "⛔ NOT INTERESTED", "UNSUBSCRIBE": "🚫 UNSUBSCRIBE",
+            }.get(intent, "💬 NEW REPLY")
+            alert(f"{badge}\nSpeaker: {name} ({company})\nEmail: {email}\nConference: {conf_name}\n"
+                  f"Intent: {intent} ({sentiment})\n\nLatest Reply:\n{latest_text[:400]}")
+        else:
+            if needs_update:
+                print(f"   📝 Updated conversation transcript for {name} <{email}> ({len(messages)} messages).")
+                thread_rec["last_msg_count"] = len(messages)
+                save_state(state)
+
+    print(f"[{now()}] --- Watcher Completed (Scanned: {checked} | New Replies: {replies_found} | "
+          f"Bounces: {bounces_found}) ---\n")
 
 
 # ==============================================================================
