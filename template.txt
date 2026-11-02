@@ -1,0 +1,12 @@
+SUBJECT: Nice to connect - {conference_name}
+
+Hi {first_name},
+
+This is {sender} from {sender_company}. Noticed your session as {job_title} at {company} for {conference_name}.
+
+Would be great to connect with you!
+
+Thank you,
+{sender}
+{sender_company}
+

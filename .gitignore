@@ -1,0 +1,7 @@
+.env
+token.json
+credentials.json
+env.example
+outreach_state.json
+service_account.json
+gemini_automation_code.py
